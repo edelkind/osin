@@ -1,6 +1,7 @@
 package osin
 
 import (
+	"errors"
 	"net/http"
 	"time"
 )
@@ -36,6 +37,9 @@ type AccessRequest struct {
 
 	// Set if a refresh token should be generated
 	GenerateRefresh bool
+
+	// Will be true if the request is an OpenID Connect request.
+	IsOpenId bool
 
 	// Data to be passed to storage. Not used by the library.
 	UserData interface{}
@@ -353,6 +357,25 @@ func (s *Server) FinishAccessRequest(w *Response, r *http.Request, ar *AccessReq
 			w.SetError(E_SERVER_ERROR, "")
 			w.InternalError = err
 			return
+		}
+
+		if ar.IsOpenId {
+			// only if this is an openid request
+
+			if ar.AuthorizeData == nil {
+				w.SetError(E_INVALID_REQUEST, "")
+				w.InternalError = errors.New("OpenID requested, but no AuthorizeData found")
+				return
+			}
+			if ar.GenerateRefresh {
+				err := s.GenerateIdToken(r, ret.AuthorizeData, ret)
+				if err != nil {
+					w.SetError(E_SERVER_ERROR, "")
+					w.InternalError = err
+					return
+				}
+			}
+
 		}
 
 		// save access token

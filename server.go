@@ -10,7 +10,7 @@ type Server struct {
 	Storage           Storage
 	AuthorizeTokenGen AuthorizeTokenGen
 	AccessTokenGen    AccessTokenGen
-	IdTokenGen        IdTokenGen
+	SigningKey        []byte // Key for JWT signatures
 }
 
 // NewServer creates a new server instance

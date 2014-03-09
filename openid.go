@@ -3,43 +3,45 @@
 package osin
 
 import (
-    "github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go"
 
-    "errors"
-    "net/http"
-    "strconv"
-    "strings"
-    "time"
+	"crypto/sha256"
+	"encoding/base64"
+	"errors"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
 )
 
 // OpenID Connect id_token data
 type IdTokenData struct {
-    Iss string // Required: Issuer
-    Sub string // Required: Subject (user identifier)
-    Aud string // Required: Audience (must contain at least the client id)
+	Iss string // Required: Issuer
+	Sub string // Required: Subject (user identifier)
+	Aud string // Required: Audience (must contain at least the client id)
 
-    Exp      uint32 // Optional: expiration time
-    Azp      string // Optional: authorized party
-    AuthTime uint32 // Optional: Authentication time (required if MaxAge is set)
+	Exp      uint32 // Optional: expiration time
+	Azp      string // Optional: authorized party
+	AuthTime uint32 // Optional: Authentication time (required if MaxAge is set)
 
-    Nonce  string // Automatic: nonce from client request
-    Iat    uint32 // Automatic: issue time
-    AtHash string // Automatic: first half of access token  TODO: implement
+	Nonce  string // Automatic: nonce from client request
+	Iat    uint32 // Automatic: issue time
+	AtHash string // Automatic: first half of access token  TODO: implement
 
-    tokenStr string // Internal
+	tokenStr string // Internal
 }
 
 func idTokenErr(what string) error {
-    return errors.New(what + " is required for the ID token")
+	return errors.New(what + " is required for the ID token")
 }
 
 type ErrorAuthExpired struct {
-    exp uint32
-    now uint32
+	exp uint32
+	now uint32
 }
 
 func (e ErrorAuthExpired) Error() string {
-    return "Authentication time expired"
+	return "Authentication time expired"
 }
 
 // Populates the IdTokenData structure with some additional info from the request.
@@ -48,92 +50,117 @@ func (e ErrorAuthExpired) Error() string {
 // application may check for this error and redirect the user to the login
 // page.
 func PopulateIdToken(r *http.Request, td *IdTokenData) (err error) {
-    // XXX: nonce is REQUIRED during Implicit Flow
-    td.Nonce = r.Form.Get("nonce")
+	// XXX: nonce is REQUIRED during Implicit Flow
+	td.Nonce = r.Form.Get("nonce")
 
-    var maxAge int
-    maxAgeVal := r.Form.Get("max_age")
+	var maxAge int
+	maxAgeVal := r.Form.Get("max_age")
 
-    if maxAgeVal != "" {
-        maxAge, err = strconv.Atoi(maxAgeVal)
-        if err != nil {
-            return
-        }
-        if td.AuthTime == 0 {
-            err = errors.New("Authentication time (AuthTime) is required for the ID token when max_age is specified")
-            return
-        }
+	if maxAgeVal != "" {
+		maxAge, err = strconv.Atoi(maxAgeVal)
+		if err != nil {
+			return
+		}
+		if td.AuthTime == 0 {
+			err = errors.New("Authentication time (AuthTime) is required for the ID token when max_age is specified")
+			return
+		}
 
-        maxAge := uint32(maxAge)
-        now := uint32(time.Now().Unix())
-        if now-td.AuthTime > maxAge {
-            err = ErrorAuthExpired{td.AuthTime + maxAge, now}
-            return
-        }
-    }
-    return
+		maxAge := uint32(maxAge)
+		now := uint32(time.Now().Unix())
+		if now-td.AuthTime > maxAge {
+			err = ErrorAuthExpired{td.AuthTime + maxAge, now}
+			return
+		}
+	}
+	return
+}
+
+func generateATHash(at string) (hashval string) {
+	hash := sha256.Sum256([]byte(at))
+	hashhalf := hash[:16]
+
+	hashval = base64.URLEncoding.EncodeToString(hashhalf)
+	return
 }
 
 // Generate the id_token.
-func GenerateIdToken(ar *AuthorizeData) (err error) {
-    token := jwt.New(jwt.GetSigningMethod("RS256"))
-    if ar.IdTokenData.Iss == "" {
-        return idTokenErr("Issuer")
-    }
-    token.Claims["iss"] = ar.IdTokenData.Iss
+func (s *Server) GenerateIdToken(r *http.Request, aud *AuthorizeData, acd *AccessData) (err error) {
 
-    if ar.IdTokenData.Sub == "" {
-        return idTokenErr("Subject")
-    }
-    token.Claims["sub"] = ar.IdTokenData.Sub
+	if aud == nil { // XXX: when does this happen?
+		return idTokenErr("Authorization data")
+	}
 
-    if ar.IdTokenData.Aud == "" {
-        return idTokenErr("Audience")
-    }
-    token.Claims["aud"] = ar.IdTokenData.Aud
+	td := aud.IdTokenData
 
-    if ar.IdTokenData.Exp == 0 {
-        ar.IdTokenData.Exp = uint32(ar.ExpireAt().Unix())
-    }
-    token.Claims["exp"] = ar.IdTokenData.Exp
+	err = PopulateIdToken(r, td)
+	if err != nil {
+		return
+	}
 
-    token.Claims["iat"] = time.Now().Unix()
+	// XXX: support HS256 as well
+	token := jwt.New(jwt.GetSigningMethod("RS256"))
+	if td.Iss == "" {
+		return idTokenErr("Issuer")
+	}
+	token.Claims["iss"] = td.Iss
 
-    if ar.IdTokenData.AuthTime > 0 {
-        token.Claims["auth_time"] = ar.IdTokenData.AuthTime
-    }
+	if td.Sub == "" {
+		return idTokenErr("Subject")
+	}
+	token.Claims["sub"] = td.Sub
 
-    if ar.IdTokenData.Nonce != "" {
-        token.Claims["nonce"] = ar.IdTokenData.Nonce
-    }
+	if td.Aud == "" {
+		return idTokenErr("Audience")
+	}
+	token.Claims["aud"] = td.Aud
 
-    // acr not supported
-    // amr not supported
+	if td.Exp == 0 {
+		td.Exp = uint32(aud.ExpireAt().Unix())
+	}
+	token.Claims["exp"] = td.Exp
 
-    // If Azp is present, it must contain the client id. If the caller didn't
-    // supply it, we add it instead of returning an error.
-    if ar.IdTokenData.Azp != "" {
-        var found bool
-        words := strings.Fields(ar.IdTokenData.Azp)
+	token.Claims["iat"] = time.Now().Unix()
 
-        for _, v := range words {
-            if v == ar.Client.Id {
-                found = true
-                break
-            }
-        }
-        if !found {
-            words = append(words, ar.Client.Id)
-        }
+	if td.AuthTime > 0 {
+		token.Claims["auth_time"] = td.AuthTime
+	}
 
-        token.Claims["azp"] = strings.Join(words, " ")
-    }
+	if td.Nonce != "" {
+		token.Claims["nonce"] = td.Nonce
+	}
 
-    if len(ar.SigningKey) == 0 {
-        return idTokenErr("Token signing key")
-    }
+	// acr not supported
+	// amr not supported
 
-    ar.IdTokenData.tokenStr, err = token.SignedString([]byte(ar.SigningKey))
-    return
+	// If Azp is present, it must contain the client id. If the caller didn't
+	// supply it, we add it instead of returning an error.
+	if td.Azp != "" {
+		var found bool
+		words := strings.Fields(td.Azp)
+
+		for _, v := range words {
+			if v == aud.Client.Id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			words = append(words, aud.Client.Id)
+		}
+
+		token.Claims["azp"] = strings.Join(words, " ")
+	}
+
+	if acd != nil && acd.AccessToken != "" {
+		token.Claims["at_hash"] = generateATHash(acd.AccessToken)
+	}
+
+	if len(s.SigningKey) == 0 {
+		return idTokenErr("Token signing key")
+	}
+
+	td.tokenStr, err = token.SignedString([]byte(s.SigningKey))
+	return
 
 }
